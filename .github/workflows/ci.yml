@@ -19,6 +19,8 @@ jobs:
   build-and-push-docker:
     runs-on: ubuntu-latest
     needs: lint-and-test
+    env:
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,7 +33,7 @@ jobs:
           docker build -t doc2pdf-frontend:latest ./frontend
 
       - name: Login to Azure Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.ACR_LOGIN_SERVER != ''
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACR_LOGIN_SERVER != ''
         uses: docker/login-action@v3
         with:
           registry: ${{ secrets.ACR_LOGIN_SERVER }}
@@ -39,7 +41,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Tag and Push Images to ACR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.ACR_LOGIN_SERVER != ''
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACR_LOGIN_SERVER != ''
         run: |
           for svc in api worker relay frontend; do
             docker tag doc2pdf-${svc}:latest ${{ secrets.ACR_LOGIN_SERVER }}/doc2pdf-${svc}:${{ github.sha }}
