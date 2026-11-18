@@ -1,0 +1,8 @@
+# Sao chep thanh terraform.tfvars tren may ca nhan truoc khi chay terraform apply
+# KHONG commit file terraform.tfvars len Git!
+
+project_name      = "doc2pdf"
+environment       = "dev"
+location          = "japaneast"
+pg_admin_username = "doc2pdfadmin"
+pg_admin_password = "ChangeMe@123456"
