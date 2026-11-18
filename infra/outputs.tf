@@ -21,3 +21,23 @@ output "postgres_fqdn" {
 output "key_vault_uri" {
   value = azurerm_key_vault.main.vault_uri
 }
+
+output "servicebus_namespace_name" {
+  value = azurerm_servicebus_namespace.main.name
+}
+
+output "servicebus_queue_name" {
+  value = azurerm_servicebus_queue.jobs.name
+}
+
+output "container_app_environment_name" {
+  value = azurerm_container_app_environment.main.name
+}
+
+output "api_url" {
+  value = "https://${azurerm_container_app.api.ingress[0].fqdn}"
+}
+
+output "worker_job_name" {
+  value = azurerm_container_app_job.worker.name
+}

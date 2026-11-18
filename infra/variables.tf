@@ -38,3 +38,9 @@ variable "pg_admin_password" {
   type        = string
   sensitive   = true
 }
+
+variable "placeholder_image" {
+  description = "Image mac dinh khi chay terraform apply lan dau truoc khi CI/CD day image that len ACR"
+  type        = string
+  default     = "mcr.microsoft.com/k8se/quickstart:latest"
+}
