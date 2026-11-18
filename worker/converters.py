@@ -1,5 +1,4 @@
 import os
-import time
 import multiprocessing
 from fpdf import FPDF
 import markdown
@@ -25,8 +24,6 @@ def _create_vietnamese_pdf() -> FPDF:
 
 def txt_to_pdf(input_path: str, output_path: str) -> str:
     validate_input_file(input_path, "txt")
-    if os.path.basename(input_path) == "slow_case.txt" or os.getenv("WORKER_SIMULATE_SLOW") == "1":
-        time.sleep(35)
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
 
@@ -41,11 +38,11 @@ def txt_to_pdf(input_path: str, output_path: str) -> str:
 def md_to_pdf(input_path: str, output_path: str) -> str:
     validate_input_file(input_path, "md")
     with open(input_path, "r", encoding="utf-8") as f:
-        md_text = f.read()
+        md_content = f.read()
 
-    html = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
+    html_content = markdown.markdown(md_content, extensions=["tables", "fenced_code"])
     pdf = _create_vietnamese_pdf()
-    pdf.write_html(html)
+    pdf.write_html(html_content)
     pdf.output(output_path)
 
     validate_output_pdf(output_path)
@@ -57,7 +54,7 @@ def image_to_pdf(input_path: str, output_path: str) -> str:
     validate_input_file(input_path, ext)
 
     with Image.open(input_path) as img:
-        if img.mode in ("RGBA", "LA", "P"):
+        if img.mode in ("RGBA", "P", "LA"):
             background = Image.new("RGB", img.size, (255, 255, 255))
             if img.mode == "P":
                 img = img.convert("RGBA")
@@ -94,19 +91,19 @@ def convert_with_timeout(input_path: str, output_path: str, timeout_seconds: int
     q = multiprocessing.Queue()
     p = multiprocessing.Process(target=_worker_target, args=(target_func, input_path, output_path, q))
     p.start()
-    p.join(timeout_seconds)
+    p.join(timeout=timeout_seconds)
 
     if p.is_alive():
         p.terminate()
         p.join()
         if os.path.exists(output_path):
             os.remove(output_path)
-        raise TimeoutError(f"Chuyển đổi vượt quá thời gian cho phép ({timeout_seconds}s)")
+        raise TimeoutError(f"Chuyển đổi vượt quá thời gian cho phép ({timeout_seconds}s).")
 
-    if not q.empty():
-        status, payload = q.get()
-        if status == "ok":
-            return payload
+    if q.empty():
+        raise RuntimeError("Tiến trình chuyển đổi bị ngắt đột ngột mà không trả kết quả.")
+
+    status, payload = q.get()
+    if status == "err":
         raise payload
-
-    raise RuntimeError("Tiến trình chuyển đổi bị ngắt đột ngột mà không trả kết quả.")
+    return payload
