@@ -1,0 +1,47 @@
+name: CD Deploy to Azure
+
+on:
+  workflow_run:
+    workflows: ["CI Workflow"]
+    types:
+      - completed
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy-azure:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    env:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+    steps:
+      - name: Azure Login
+        if: env.AZURE_CREDENTIALS != ''
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update Container App API
+        if: env.AZURE_CREDENTIALS != ''
+        run: |
+          az containerapp update \
+            --name ca-doc2pdf-api \
+            --resource-group rg-doc2pdf-dev \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/doc2pdf-api:latest
+
+      - name: Update Container App Relay
+        if: env.AZURE_CREDENTIALS != ''
+        run: |
+          az containerapp update \
+            --name ca-doc2pdf-relay \
+            --resource-group rg-doc2pdf-dev \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/doc2pdf-relay:latest
+
+      - name: Update Container Apps Job Worker
+        if: env.AZURE_CREDENTIALS != ''
+        run: |
+          az containerapp job update \
+            --name job-doc2pdf-worker \
+            --resource-group rg-doc2pdf-dev \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/doc2pdf-worker:latest
