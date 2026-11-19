@@ -24,6 +24,14 @@ EXT_TO_FORMAT = {"txt": "txt", "md": "md", "markdown": "md", "png": "png", "jpg"
 MESSAGE_TYPE = "job.convert.requested"
 
 
+def source_object_key(job_id: uuid.UUID, filename: str, fmt: str) -> str:
+    """Khoá nguồn giữ tên gốc (đã làm sạch) và đuôi chuẩn hoá: worker chọn bộ chuyển đổi theo đuôi file
+    của source_key, và nhận diện file demo (vd slow_case.txt) theo tên."""
+    stem = os.path.splitext(filename)[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:80] or "source"
+    return f"jobs/{job_id}/{stem}.{fmt}"
+
+
 def clean_filename(name: str | None) -> str:
     base = os.path.basename((name or "").replace("\\", "/"))
     base = re.sub(r"[\x00-\x1f\x7f]", "", base).strip()
@@ -50,7 +58,7 @@ def enqueue_job(db: Session, job: ConversionJob, delay_seconds: float = 0) -> Ou
         payload={
             "schema_version": 1, "message_id": str(mid), "type": MESSAGE_TYPE,
             "job_id": str(job.id), "source_key": job.source.object_key,
-            "format": job.source_format, "request_id": job.request_id,
+            "source_bucket": job.source.bucket, "format": job.source_format, "request_id": job.request_id,
             "enqueued_at": now.isoformat(),
         },
     )
@@ -72,7 +80,7 @@ def create_job(db: Session, storage: Storage, owner_id: str, filename: str | Non
 
     job_id = uuid.uuid4()
     checksum = hashlib.sha256(data).hexdigest()
-    key = f"jobs/{job_id}/source"
+    key = source_object_key(job_id, filename, fmt)
     storage.put_source(key, data, content_type)  # ghi object trước, DB sau
     try:
         job = ConversionJob(
@@ -116,7 +124,7 @@ def retry_job(db: Session, job_id: uuid.UUID, p: Principal) -> ConversionJob:
         raise ApiError(409, "INVALID_STATE", "Chỉ job ở trạng thái failed mới retry được",
                        {"status": job.status})
     job.status = QUEUED
-    job.max_attempts = job.attempts + get_settings().max_attempts  # cấp lại ngân sách thử
+    job.attempts, job.max_attempts = 0, get_settings().max_attempts  # cấp lại ngân sách thử (lịch sử còn ở attempts)
     job.error_code = job.error_message = None
     job.worker_id = job.lease_expires_at = job.finished_at = None
     enqueue_job(db, job)

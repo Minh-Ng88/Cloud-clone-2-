@@ -13,16 +13,19 @@ log = logging.getLogger("app.errors")
 
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str, details: dict | None = None,
-                 headers: dict | None = None):
+                 headers: dict | None = None, detail: str | None = None):
         self.status, self.code, self.message = status, code, message
-        self.details, self.headers = details, headers
+        self.details, self.headers, self.detail = details, headers, detail
 
 
-def error_body(code: str, message: str, details=None) -> dict:
+def error_body(code: str, message: str, details=None, detail: str | None = None) -> dict:
     err = {"code": code, "message": message, "request_id": request_id_var.get()}
     if details:
         err["details"] = details
-    return {"error": err}
+    body = {"error": err}
+    if detail:  # chuỗi tiếng Anh ngắn ở cấp cao nhất, cho client đọc `detail` (worker /api/internal)
+        body["detail"] = detail
+    return body
 
 
 _HTTP_CODES = {400: "BAD_REQUEST", 401: "UNAUTHENTICATED", 403: "FORBIDDEN", 404: "NOT_FOUND",
@@ -32,7 +35,7 @@ _HTTP_CODES = {400: "BAD_REQUEST", 401: "UNAUTHENTICATED", 403: "FORBIDDEN", 404
 def install_handlers(app) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError):
-        return JSONResponse(error_body(exc.code, exc.message, exc.details), status_code=exc.status,
+        return JSONResponse(error_body(exc.code, exc.message, exc.details, exc.detail), status_code=exc.status,
                             headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)

@@ -10,10 +10,9 @@ import logging
 import os
 import time
 
-from pika.exceptions import AMQPError
 from sqlalchemy import create_engine, text
 
-from publisher import PermanentPublishError, RabbitPublisher
+from publisher import PermanentPublishError, create_publisher
 from reaper import reclaim_expired
 
 log = logging.getLogger("relay")
@@ -22,7 +21,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://doc2pdf:doc2pdf_dev_passw
 for _p in ("postgresql://", "postgres://"):
     if DATABASE_URL.startswith(_p):
         DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_p):]
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://doc2pdf:doc2pdf_dev_password@localhost:5672/")
 POLL_SECONDS = float(os.getenv("RELAY_POLL_SECONDS", "1"))
 BATCH_SIZE = int(os.getenv("RELAY_BATCH_SIZE", "50"))
 REAPER_INTERVAL = float(os.getenv("REAPER_INTERVAL_SECONDS", "10"))  # chu kỳ thu hồi lease hết hạn
@@ -58,8 +56,9 @@ def publish_batch(engine, publisher) -> int:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("pika").setLevel(logging.WARNING)
+    logging.getLogger("azure").setLevel(logging.WARNING)
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-    publisher = RabbitPublisher(RABBITMQ_URL)
+    publisher = create_publisher()
     last_reap = 0.0
     while True:
         try:
@@ -70,15 +69,12 @@ def main() -> None:
                     log.warning("reclaimed expired leases: requeued=%d failed=%d", requeued, failed)
             if publisher.closed:
                 publisher.connect()
-                log.info("connected to RabbitMQ")
+                log.info("connected to queue (%s)", type(publisher).__name__)
             if publish_batch(engine, publisher) == 0:
                 publisher.wait(POLL_SECONDS)
-        except AMQPError as e:
-            log.warning("RabbitMQ error (%s); reconnecting", type(e).__name__)
-            publisher.conn = None
-            time.sleep(3)
-        except Exception as e:  # DB chưa sẵn sàng, mất kết nối...
+        except Exception as e:  # hàng đợi/DB tạm thời không sẵn sàng: đóng kết nối, thử lại (không mất sự kiện)
             log.warning("relay error (%s: %s); retrying", type(e).__name__, str(e)[:200])
+            publisher.close()
             time.sleep(3)
 
 
