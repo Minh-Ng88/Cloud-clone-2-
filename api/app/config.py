@@ -24,8 +24,13 @@ class Settings(BaseSettings):
     demo_accounts: str = "alice:alice123:user,bob:bob123:user,operator:operator123:operator"
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # Worker gọi /api/internal/* bằng header X-Service-Key (cùng tên biến, cùng mặc định với worker/)
+    internal_service_key: str = "dev-internal-key"
+    converter_version: str = "doc2pdf-converters-1"  # ghi vào ResultObject khi worker không báo phiên bản
+
     # Job / tải về
     max_attempts: int = 3  # ngân sách thử ghi vào job khi tạo / retry
+    result_ttl_hours: int = 24  # PDF hết hạn tải sau thời gian này
     download_url_ttl_seconds: int = 600  # 10 phút (theo docs/test-plan.md)
 
     @field_validator("database_url")

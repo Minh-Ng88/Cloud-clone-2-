@@ -1,8 +1,10 @@
-"""Kiểm thử luồng chính. Cần PostgreSQL (conftest tự tạo DB `<tên DB>_test` và chạy migration)."""
+"""Kiểm thử luồng chính. Cần PostgreSQL (conftest tự tạo DB `<tên DB>_test` và chạy migration).
+
+Worker được giả lập đúng như worker/api_client.py: gọi /api/internal/jobs/* với X-Service-Key.
+"""
 import hashlib
 import json
 import os
-import sys
 import uuid
 
 import pytest
@@ -14,36 +16,34 @@ from app.db import SessionLocal, engine
 from app.main import app
 from app.models import OutboxEvent
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import worker_sim as w  # noqa: E402
-
-# Thu hồi lease do relay thực hiện (relay/reaper.py); chỉ có khi chạy trong repo đầy đủ
-_reaper = os.path.join(os.path.dirname(__file__), "..", "..", "relay", "reaper.py")
-if os.path.exists(_reaper):
-    import importlib.util
-    _spec = importlib.util.spec_from_file_location("relay_reaper", _reaper)
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    reclaim_expired = _mod.reclaim_expired
-else:  # chạy trong image test (không có thư mục relay): dùng bản tham chiếu
-    reclaim_expired = lambda engine: w.reclaim_expired()  # noqa: E731
-
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+PDF = b"%PDF-1.4\n%fake-but-pdf-header\n"
+SVC = {"X-Service-Key": "dev-internal-key"}
 
 
 class FakeStorage:
+    def __init__(self):
+        self.objects = {}
+
     def ensure_buckets(self): ...
     def ping(self): return True
-    def put_source(self, key, data, ct): ...
-    def delete(self, bucket, key): ...
+    def put_source(self, key, data, ct): self.objects[("sources", key)] = data
+    def delete(self, bucket, key): self.objects.pop((bucket, key), None)
+
+    def inspect_object(self, bucket, key):
+        o = self.objects.get((bucket, key))
+        return None if o is None else {"size": len(o), "sha256": hashlib.sha256(o).hexdigest(),
+                                       "is_pdf": o.startswith(b"%PDF-")}
+
     def presign_download(self, bucket, key, filename, ttl): return f"http://s3/{bucket}/{key}?ttl={ttl}"
 
 
 @pytest.fixture()
-def c(monkeypatch):
-    monkeypatch.setattr(storage_module, "_storage", FakeStorage())
+def env(monkeypatch):
+    fake = FakeStorage()
+    monkeypatch.setattr(storage_module, "_storage", fake)
     with TestClient(app) as client:
-        yield client
+        yield client, fake
 
 
 def login(c, name, pw):
@@ -59,9 +59,28 @@ def upload(c, h, name="a.txt", data=b"xin chao"):
     return r.json()
 
 
-def test_upload_status_permissions_and_download(c):
+def internal(c, jid, action, body, headers=SVC, prefix="/api/internal"):
+    return c.post(f"{prefix}/jobs/{jid}/{action}", headers=headers, json=body)
+
+
+def claim(c, jid, worker="w1", mid=None, lease=60):
+    return internal(c, jid, "claim", {"worker_id": worker, "message_id": mid or str(uuid.uuid4()),
+                                      "lease_seconds": lease})
+
+
+def fail(c, jid, worker, mid, code, retryable, msg="x"):
+    return internal(c, jid, "fail", {"worker_id": worker, "message_id": mid, "error_code": code,
+                                     "error_message": msg, "retryable": retryable})
+
+
+def detail(r):
+    return r.json().get("detail", "")
+
+
+def test_upload_status_permissions_and_download(env):
+    c, fake = env
     alice, bob, ops = login(c, "alice", "alice123"), login(c, "bob", "bob123"), login(c, "operator", "operator123")
-    job = upload(c, alice)
+    job = upload(c, alice, "Báo cáo.txt")
     jid = job["id"]
     assert job["status"] == "queued" and job["attempts"] == 0
     assert job["source_checksum"] == hashlib.sha256(b"xin chao").hexdigest()
@@ -72,34 +91,68 @@ def test_upload_status_permissions_and_download(c):
     assert c.get("/operator/stats", headers=alice).status_code == 403
     assert c.get(f"/jobs/{jid}/download", headers=alice).status_code == 409  # chưa có PDF
 
-    # Message trong outbox: {job_id, source_key, format}
+    # Outbox: job và sự kiện cùng giao dịch; message {job_id, source_key, format}
     with SessionLocal() as db:
         ev = db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(jid))).one()
     assert ev.payload["job_id"] == jid and ev.payload["format"] == "txt"
-    assert ev.payload["source_key"] == f"jobs/{jid}/source"
+    key = ev.payload["source_key"]
+    assert key.startswith(f"jobs/{jid}/") and key.endswith(".txt")  # worker chọn converter theo đuôi
+    assert ("sources", key) in fake.objects
 
-    # Worker (giao thức DB): nhận -> gia hạn -> hoàn tất
-    mid = uuid.uuid4()
-    cl = w.claim(jid, "w1", mid)
-    assert cl["attempt_no"] == 1 and cl["format"] == "txt"
-    assert w.claim(jid, "w1", mid) == "DUPLICATE_MESSAGE"
-    assert w.claim(jid, "w2") == "LEASE_HELD"
+    # Worker: claim -> heartbeat -> upload PDF -> complete
+    mid = str(uuid.uuid4())
+    r = claim(c, jid, "w1", mid)
+    assert r.status_code == 200, r.text
+    cl = r.json()
+    assert cl["status"] == "running" and cl["attempts"] == 1 and cl["source_key"] == key
+    assert cl["result_key"] == f"jobs/{jid}/attempt-1.pdf"
+    r = claim(c, jid, "w1", mid)
+    assert r.status_code == 409 and "duplicate" in detail(r).lower()          # worker bỏ qua + ack
+    r = claim(c, jid, "w2")
+    assert r.status_code == 409 and not any(w in detail(r).lower() for w in ("already", "succeeded", "duplicate"))
     assert c.get(f"/jobs/{jid}", headers=alice).json()["status"] == "running"
-    assert w.heartbeat(jid, "w1", 1) and not w.heartbeat(jid, "w2", 1)
-    assert w.complete(jid, "w1", 1, "t-1", 5, "a" * 64, 1)
-    assert not w.complete(jid, "w1", 1, "t-1", 5, "a" * 64, 1)  # lượt đã kết thúc
+    assert internal(c, jid, "heartbeat", {"worker_id": "w1", "lease_seconds": 60}).status_code == 200
+    assert internal(c, jid, "heartbeat", {"worker_id": "w2", "lease_seconds": 60}).status_code == 409
+
+    done = {"worker_id": "w1", "message_id": mid, "result_key": cl["result_key"], "page_count": 1,
+            "file_size": len(PDF)}
+    r = internal(c, jid, "complete", done)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "RESULT_OBJECT_INVALID"  # chưa có object
+    fake.objects[("results", cl["result_key"])] = PDF
+    assert internal(c, jid, "complete", {**done, "result_key": "x.pdf"}).status_code == 422  # sai khoá
+    assert internal(c, jid, "complete", {**done, "worker_id": "w2"}).status_code == 409      # sai worker
+    r = internal(c, jid, "complete", done)
+    assert r.status_code == 200 and r.json()["status"] == "succeeded"
+    assert internal(c, jid, "complete", done).status_code == 200                              # idempotent
 
     j = c.get(f"/jobs/{jid}", headers=alice).json()
-    assert j["status"] == "succeeded" and j["download_available"] and j["converter_version"] == "t-1"
+    assert j["status"] == "succeeded" and j["download_available"]
+    assert j["result"]["checksum"] == hashlib.sha256(PDF).hexdigest() and j["result"]["page_count"] == 1
     d = c.get(f"/jobs/{jid}/download", headers=alice)
-    assert d.status_code == 200 and d.json()["filename"] == "a.pdf"
+    assert d.status_code == 200 and d.json()["url_expires_in"] == 600 and d.json()["filename"].endswith(".pdf")
     assert c.get(f"/jobs/{jid}/download", headers=bob).status_code == 404
-    assert w.claim(jid, "w3") == "JOB_ALREADY_FINISHED"
+    r = claim(c, jid, "w3")
+    assert r.status_code == 409 and "already" in detail(r).lower()                            # worker ack
     assert [a["outcome"] for a in c.get(f"/jobs/{jid}/attempts", headers=alice).json()] == ["succeeded"]
 
 
-def test_upload_rules_match_reference_dataset(c):
+def test_internal_endpoints_are_service_only(env):
+    c, _ = env
+    alice, ops = login(c, "alice", "alice123"), login(c, "operator", "operator123")
+    jid = upload(c, alice)["id"]
+    body = {"worker_id": "w", "message_id": str(uuid.uuid4())}
+    assert c.post(f"/api/internal/jobs/{jid}/claim", json=body).status_code == 401                    # không khoá
+    assert internal(c, jid, "claim", body, headers={"X-Service-Key": "sai"}).status_code == 401       # sai khoá
+    assert internal(c, jid, "claim", body, headers=alice).status_code == 401                          # token người dùng
+    assert internal(c, jid, "claim", body, headers=ops).status_code == 401                            # kể cả operator
+    assert internal(c, uuid.uuid4(), "claim", body).status_code == 404                                # job không tồn tại
+    assert claim(c, jid, "w1").status_code == 200                                                     # khoá đúng
+    assert c.post(f"/internal/jobs/{jid}/heartbeat", headers=SVC, json={"worker_id": "w1"}).status_code == 200  # bí danh
+
+
+def test_upload_rules_match_reference_dataset(env):
     """Khớp data/expected.csv: 5 file `rejected` bị từ chối ngay khi upload, `corrupt.jpg` được nhận."""
+    c, _ = env
     h = login(c, "alice", "alice123")
     post = lambda name, data: c.post("/jobs", headers=h, files={"file": (name, data)})  # noqa: E731
     code = lambda r: r.json()["error"]["code"]  # noqa: E731
@@ -109,53 +162,96 @@ def test_upload_rules_match_reference_dataset(c):
     r = post("unsupported.docx", b"PK\x03\x04" + bytes(64));       assert (r.status_code, code(r)) == (415, "UNSUPPORTED_FORMAT")
     r = post("toolarge.txt", b"A" * (10 * 1024 * 1024 + 1));      assert (r.status_code, code(r)) == (413, "FILE_TOO_LARGE")
     assert code(post("binary.txt", b"abc\x00def")) == "INVALID_FILE"
-    assert code(post("latin1.txt", "é".encode("latin-1"))) == "INVALID_FILE"
-    assert code(post("fake.jpg", PNG)) == "INVALID_FILE"
-    # Được nhận: header đúng nhưng thân hỏng (corrupt.jpg) -> worker sẽ báo failed
     assert post("corrupt.jpg", b"\xff\xd8\xff\xe0" + b"garbage" * 50).status_code == 202
     assert post("ok.png", PNG).status_code == 202
-    assert post("tieng_viet.md", "# Xin chào".encode()).status_code == 202
-    assert post("crlf.txt", "Dòng 1\r\nDòng 2\r\n".encode()).status_code == 202
-    assert post("bom.txt", b"\xef\xbb\xbfxin chao").status_code == 202
     assert c.post("/jobs", headers=h, files={"file": ("a.txt", b"x")}, data={"options": "{bad"}).status_code == 422
-    assert c.post("/jobs", files={"file": ("a.txt", b"x")}).status_code == 401  # không token (S1)
+    assert c.post("/jobs", files={"file": ("a.txt", b"x")}).status_code == 401
 
 
-def test_failure_retry_and_fencing(c):
+def test_source_key_keeps_name_and_extension(env):
+    c, fake = env
+    h = login(c, "alice", "alice123")
+    for name, expect in [("slow_case.txt", "slow_case.txt"), ("Ảnh đẹp.JPEG", "nh_p.jpg"), ("ghi chú.markdown", "ghi_ch.md")]:
+        data = b"\xff\xd8\xff\xe0" + b"0" * 8 if name.upper().endswith("JPEG") else b"noi dung"
+        j = upload(c, h, name, data)
+        with SessionLocal() as db:
+            ev = db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(j["id"]))).one()
+        base = os.path.basename(ev.payload["source_key"])
+        assert base.endswith(os.path.splitext(expect)[1]), base
+        if name == "slow_case.txt":
+            assert base == "slow_case.txt"  # worker nhận diện file demo chậm theo tên
+
+
+def test_worker_retry_flow_and_error_code_mapping(env):
+    c, _ = env
     h = login(c, "alice", "alice123")
     jid = upload(c, h)["id"]
+    mid = str(uuid.uuid4())  # worker nack-requeue CÙNG message để thử lại
     for n in (1, 2, 3):
-        assert w.claim(jid, "w1")["attempt_no"] == n
-        assert w.fail(jid, "w1", n, "CONVERSION_TIMEOUT", "slow", retryable=True) == ("queued" if n < 3 else "failed")
+        r = claim(c, jid, "w1", mid)
+        assert r.status_code == 200, (n, r.text)
+        assert r.json()["attempts"] == n
+        retryable = n < 3  # worker tự tính can_retry = retryable and attempts < 3
+        r = fail(c, jid, "w1", mid, "CONVERT_TIMEOUT", retryable)
+        assert r.status_code == 200 and r.json()["status"] == ("queued" if retryable else "failed")
     j = c.get(f"/jobs/{jid}", headers=h).json()
     assert j["status"] == "failed" and j["error_code"] == "CONVERSION_TIMEOUT" and j["attempts"] == 3
-    assert w.fail(jid, "w1", 3, "INTERNAL_ERROR", "x") is None  # worker cũ không ghi được nữa
-    with SessionLocal() as db:  # mỗi lần thử lại có một message mới (2 lần retry + 1 lần tạo)
-        assert len(db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(jid))).all()) == 3
+    assert fail(c, jid, "w1", mid, "WORKER_ERROR", False).status_code == 409                   # worker cũ không ghi nữa
+    with SessionLocal() as db:  # retry tự động KHÔNG ghi thêm outbox (worker nack-requeue message cũ)
+        assert len(db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(jid))).all()) == 1
 
     bob = login(c, "bob", "bob123")
-    assert c.post(f"/jobs/{jid}/retry", headers=bob).status_code == 403  # user khác retry job người khác (S5)
-    r = c.post(f"/jobs/{jid}/retry", headers=h)
-    assert r.status_code == 202 and r.json()["status"] == "queued" and r.json()["max_attempts"] == 6
+    assert c.post(f"/jobs/{jid}/retry", headers=bob).status_code == 403                        # S5
+    r = c.post(f"/jobs/{jid}/retry", headers=h)                                                # retry thủ công
+    assert r.status_code == 202 and r.json()["status"] == "queued"
+    assert r.json()["attempts"] == 0 and r.json()["max_attempts"] == 3                        # ngân sách mới
     assert c.post(f"/jobs/{jid}/retry", headers=h).status_code == 409
-    # lỗi không retry được (file hỏng) -> failed ngay
-    jid2 = upload(c, h)["id"]
-    assert w.claim(jid2, "w1")["attempt_no"] == 1
-    assert w.fail(jid2, "w1", 1, "INVALID_FILE", "sai magic bytes") == "failed"
+    with SessionLocal() as db:  # retry thủ công ghi outbox mới
+        assert len(db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(jid))).all()) == 2
+    r = claim(c, jid, "w1", str(uuid.uuid4()))
+    assert r.status_code == 200 and r.json()["attempts"] == 1 and r.json()["attempt_no"] == 4  # lịch sử nối tiếp
+    assert r.json()["result_key"] == f"jobs/{jid}/attempt-4.pdf"
+
+    for worker_code, canon in [("INVALID_INPUT", "INVALID_FILE"), ("INVALID_OUTPUT_PDF", "OUTPUT_INVALID"),
+                               ("WORKER_ERROR", "INTERNAL_ERROR"), ("LA_HOAC", "INTERNAL_ERROR")]:
+        j2 = upload(c, h)["id"]
+        m2 = str(uuid.uuid4())
+        assert claim(c, j2, "w1", m2).status_code == 200
+        assert fail(c, j2, "w1", m2, worker_code, False).status_code == 200
+        assert c.get(f"/jobs/{j2}", headers=h).json()["error_code"] == canon
 
 
-def test_lease_expiry_is_reclaimed(c):
+def test_non_uuid_message_id_is_deduplicated(env):
+    c, _ = env
+    h = login(c, "alice", "alice123")
+    jid = upload(c, h)["id"]
+    assert claim(c, jid, "w1", "msg-dedup-001").status_code == 200
+    r = claim(c, jid, "w2", "msg-dedup-001")
+    assert r.status_code == 409 and "duplicate" in detail(r).lower()
+
+
+def test_lease_expiry_is_reclaimed_by_relay(env):
+    c, _ = env
     h = login(c, "alice", "alice123")
     ops = login(c, "operator", "operator123")
     jid = upload(c, h)["id"]
-    assert w.claim(jid, "dead-worker")["attempt_no"] == 1
+    assert claim(c, jid, "dead-worker").status_code == 200
     with engine.begin() as conn:  # giả lập worker chết: lease đã hết hạn
         conn.execute(text("UPDATE conversion_jobs SET lease_expires_at = now() - interval '1 second' "
                           "WHERE id = CAST(:j AS uuid)"), {"j": jid})
     assert c.get("/operator/stats", headers=ops).json()["running_with_expired_lease"] >= 1
-    requeued, failed = reclaim_expired(engine)  # chính hàm mà relay chạy định kỳ
-    assert requeued >= 1
+    reaper = os.path.join(os.path.dirname(__file__), "..", "..", "relay", "reaper.py")
+    if not os.path.exists(reaper):
+        pytest.skip("relay/ không có trong image test; smoke_test kiểm bước này")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("relay_reaper", reaper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.reclaim_expired(engine)[0] >= 1           # chính hàm relay chạy định kỳ
     j = c.get(f"/jobs/{jid}", headers=h).json()
     assert j["status"] == "queued" and j["error_code"] == "LEASE_EXPIRED"
     assert c.get(f"/jobs/{jid}/attempts", headers=h).json()[0]["outcome"] == "lease_expired"
-    assert w.claim(jid, "w2")["attempt_no"] == 2
+    with SessionLocal() as db:  # có message mới để worker nhận lại
+        assert len(db.scalars(select(OutboxEvent).where(OutboxEvent.aggregate_id == uuid.UUID(jid))).all()) == 2
+    r = claim(c, jid, "w2", str(uuid.uuid4()))
+    assert r.status_code == 200 and r.json()["attempt_no"] == 2

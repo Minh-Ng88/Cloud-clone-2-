@@ -37,7 +37,8 @@ def reclaim_expired(engine, limit: int = 50) -> tuple[int, int]:
                     SELECT CAST(:mid AS uuid), j.id, 'job.convert.requested',
                            jsonb_build_object('schema_version', 1, 'message_id', CAST(:mid AS text),
                                               'type', 'job.convert.requested', 'job_id', CAST(j.id AS text),
-                                              'source_key', s.object_key, 'format', j.source_format,
+                                              'source_key', s.object_key, 'source_bucket', s.bucket,
+                                              'format', j.source_format,
                                               'request_id', j.request_id, 'enqueued_at', now()),
                            now(), now()
                     FROM conversion_jobs j JOIN source_objects s ON s.job_id = j.id WHERE j.id = :j"""),

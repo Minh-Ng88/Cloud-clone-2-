@@ -2,7 +2,7 @@ import hmac
 from datetime import timedelta
 
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -58,3 +58,9 @@ def require_operator(p: Principal = Depends(current_principal)) -> Principal:
     if not p.is_operator:
         raise ApiError(403, "FORBIDDEN", "Chỉ operator mới được dùng chức năng này")
     return p
+
+
+def require_service(x_service_key: str | None = Header(default=None)) -> None:
+    """Chỉ worker (giữ khoá dịch vụ) được gọi /api/internal/*; người dùng không bao giờ có khoá này."""
+    if not x_service_key or not hmac.compare_digest(x_service_key, get_settings().internal_service_key):
+        raise ApiError(401, "UNAUTHENTICATED", "Service key không hợp lệ", detail="Invalid service key")

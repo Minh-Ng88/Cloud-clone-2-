@@ -1,3 +1,4 @@
 SQLAlchemy==2.1.8
 psycopg2-binary==2.9.13
 pika==1.4.4
+azure-servicebus>=7.12.0

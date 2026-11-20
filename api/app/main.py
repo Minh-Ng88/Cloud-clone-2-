@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.errors import error_body, install_handlers, request_id_var
 from app.logging_setup import setup_logging
-from app.routers import auth, health, jobs, operator
+from app.routers import auth, health, internal, jobs, operator
 from app.storage import get_storage
 
 setup_logging()
@@ -66,3 +66,6 @@ app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_origin_list
 
 for r in (health.router, auth.router, jobs.router, operator.router):
     app.include_router(r)
+# Worker gọi /api/internal/jobs/...; /internal/jobs/... là bí danh không hiện trong tài liệu OpenAPI
+app.include_router(internal.router, prefix="/api/internal")
+app.include_router(internal.router, prefix="/internal", include_in_schema=False)

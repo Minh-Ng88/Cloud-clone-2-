@@ -145,3 +145,58 @@ class OutboxOut(BaseModel):
     published_at: datetime | None
     publish_attempts: int
     last_error: str | None
+
+
+# ---------- Internal (worker) ----------
+class ClaimIn(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    message_id: str | None = Field(default=None, max_length=128)
+    lease_seconds: int | None = Field(default=None, ge=5)
+
+
+class ClaimOut(BaseModel):
+    job_id: uuid.UUID
+    status: str
+    attempts: int          # lần thử trong đợt hiện tại (reset khi retry thủ công)
+    attempt_no: int        # số thứ tự lần xử lý trong lịch sử của job
+    max_attempts: int
+    lease_expires_at: datetime
+    source_format: str
+    original_filename: str
+    options: dict
+    source_bucket: str
+    source_key: str
+    source_size_bytes: int
+    source_checksum: str
+    result_bucket: str
+    result_key: str
+
+
+class HeartbeatIn(BaseModel):
+    worker_id: str
+    lease_seconds: int | None = Field(default=None, ge=5)
+
+
+class HeartbeatOut(BaseModel):
+    status: str
+    lease_expires_at: datetime
+
+
+class CompleteIn(BaseModel):
+    worker_id: str
+    message_id: str | None = None
+    result_key: str
+    page_count: int = Field(ge=1)
+    file_size: int = Field(gt=0)
+    converter_version: str | None = Field(default=None, max_length=64)
+    duration_ms: int | None = Field(default=None, ge=0)
+
+
+class FailIn(BaseModel):
+    worker_id: str
+    message_id: str | None = None
+    error_code: str = Field(max_length=64)
+    error_message: str = Field(default="", max_length=4000)
+    retryable: bool = False
+    converter_version: str | None = Field(default=None, max_length=64)
+    duration_ms: int | None = Field(default=None, ge=0)

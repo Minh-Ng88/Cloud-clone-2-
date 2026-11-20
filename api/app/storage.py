@@ -38,6 +38,23 @@ class Storage:
     def delete(self, bucket: str, key: str) -> None:
         self.client.delete_object(Bucket=bucket, Key=key)
 
+    def inspect_object(self, bucket: str, key: str, max_bytes: int = 64 * 1024 * 1024) -> dict | None:
+        """Đọc object để lấy kích thước, SHA-256 và kiểm tra header PDF. None nếu không tồn tại."""
+        import hashlib
+        try:
+            body = self.client.get_object(Bucket=bucket, Key=key)["Body"]
+        except ClientError:
+            return None
+        h, size, head = hashlib.sha256(), 0, b""
+        for chunk in body.iter_chunks(1024 * 1024):
+            if not head:
+                head = chunk[:5]
+            size += len(chunk)
+            if size > max_bytes:
+                break
+            h.update(chunk)
+        return {"size": size, "sha256": h.hexdigest(), "is_pdf": head == b"%PDF-"}
+
     def presign_download(self, bucket: str, key: str, filename: str, ttl: int) -> str:
         disposition = f"attachment; filename=\"result.pdf\"; filename*=UTF-8''{quote(filename)}"
         return self.signer.generate_presigned_url(
